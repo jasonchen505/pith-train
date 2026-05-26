@@ -19,7 +19,7 @@ from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
-from pithtrain.operators.ring_attention import ring_attention_func
+from pithtrain.operators.ring_attention import mla_ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -358,7 +358,6 @@ class DeepseekV2LiteAttention(nn.Module):
 
         self.cp_group = cp_group
         self.use_ring_attn = cp_group is not None and cp_group.size() > 1
-        self._disable_ring_attn = False
 
         LinearCls = get_linear_cls()
         self.q_proj = LinearCls(self.hidden_size, self.num_heads * self.q_head_dim, bias=False)
@@ -393,25 +392,31 @@ class DeepseekV2LiteAttention(nn.Module):
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
-            bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-
-        k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        normed_kv = self.kv_a_layernorm(compressed_kv)
         cos, sin = position_embeddings
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
 
-        if self.use_ring_attn and not self._disable_ring_attn:
-            query_states = torch.cat([q_nope, q_pe], dim=-1)
-            key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
-            attn_output = ring_attention_func(
-                query_states,
-                key_states,
-                value_states.contiguous(),
+        if self.use_ring_attn:
+            # MLA context parallelism: rotate the compressed latent (normed_kv + shared
+            # k_pe) around the ring and decompress on each rank via kv_b, instead of
+            # decompressing to full per-head K/V before rotating. ~9x less ring traffic
+            # for DeepSeek-V2-Lite.
+            attn_output = mla_ring_attention_func(
+                q_nope,
+                q_pe,
+                normed_kv.contiguous(),
+                k_pe.contiguous(),
+                self.kv_b_proj.weight,
                 sm_scale=self.softmax_scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                v_head_dim=self.v_head_dim,
                 cp_group=self.cp_group,
             )
         else:
+            kv = self.kv_b_proj(normed_kv).view(
+                bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             attn_output = mla_flash_attn_func(
                 q_nope,
                 q_pe,
@@ -614,14 +619,10 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         if position_embeddings is None:
             raise RuntimeError("Position embeddings must be set before calling reference_forward")
 
-        self.self_attn._disable_ring_attn = True
-        try:
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-            )
-        finally:
-            self.self_attn._disable_ring_attn = False
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+        )
         hidden_states = residual + hidden_states
 
         # Fully Connected
