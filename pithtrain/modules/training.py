@@ -46,8 +46,9 @@ class TrainingCfg(SlottedDefault):
     max_lr: float
     """The maximum learning rate."""
 
-    warmup_steps: int
-    """The number of steps for linear warmup of the learning rate."""
+    warmup_steps: int = 0
+    """The number of steps for linear warmup of the learning rate; 0 (the default) disables
+    warmup, e.g. for a mid-training decay run that plugs into an existing checkpoint."""
 
     max_steps: int
     """The maximum number of training steps."""
@@ -65,8 +66,15 @@ class TrainingCfg(SlottedDefault):
     optimizer: Literal["Adam"]
     """The optimizer to use during training."""
 
-    scheduler: Literal["CosineAnnealing", "Constant"]
+    scheduler: Literal["CosineAnnealing", "Constant", "WSD"]
     """The learning rate scheduler to use after linear warmup."""
+
+    wsd_decay_type: Literal["linear", "cosine"] = "cosine"
+    """Shape of the WSD decay tail. Only used when ``scheduler == "WSD"``."""
+
+    wsd_decay_steps: int = 0
+    """Number of steps in the WSD decay tail; the stable phase is the remainder
+    (``max_steps - warmup_steps - wsd_decay_steps``). Only used when ``scheduler == "WSD"``."""
 
     model: Union[
         Path,
@@ -412,15 +420,49 @@ def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
 def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     min_lr, max_lr = cfg.min_lr, cfg.max_lr
     warmup_steps, max_steps = cfg.warmup_steps, cfg.max_steps
-    warmup = LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps)
+    post_steps = max_steps - warmup_steps
+    if post_steps <= 0:
+        raise ValueError(
+            f"max_steps must be greater than warmup_steps; got "
+            f"max_steps={max_steps}, warmup_steps={warmup_steps}"
+        )
+    # Linear warmup min_lr -> max_lr. Skipped when warmup_steps == 0: a zero-length
+    # LinearLR is degenerate and would otherwise pin the following phase at min_lr.
+    phases, milestones = [], []
+    if warmup_steps > 0:
+        phases.append(LinearLR(ctx.optimizer, min_lr / max_lr, 1.0, warmup_steps))
+        milestones.append(warmup_steps)
     match cfg.scheduler:
         case "CosineAnnealing":
-            stable = CosineAnnealingLR(ctx.optimizer, max_steps - warmup_steps, min_lr)
+            phases.append(CosineAnnealingLR(ctx.optimizer, post_steps, min_lr))
         case "Constant":
-            stable = LinearLR(ctx.optimizer, 1.0, 1.0, max_steps - warmup_steps)
+            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, post_steps))
+        case "WSD":
+            # warmup -> stable (hold max_lr) -> decay (max_lr to min_lr) over wsd_decay_steps.
+            # Bound it so both the stable and decay phases are non-degenerate: 0-length phases
+            # give SequentialLR a zero T_max/total_iters (ZeroDivisionError) or non-increasing
+            # milestones (silently wrong LR).
+            if not 0 < cfg.wsd_decay_steps < post_steps:
+                raise ValueError(
+                    f"WSD needs 0 < wsd_decay_steps < max_steps - warmup_steps; got "
+                    f"wsd_decay_steps={cfg.wsd_decay_steps}, warmup_steps={warmup_steps}, "
+                    f"max_steps={max_steps}"
+                )
+            stable_steps = post_steps - cfg.wsd_decay_steps
+            phases.append(LinearLR(ctx.optimizer, 1.0, 1.0, stable_steps))
+            match cfg.wsd_decay_type:
+                case "linear":
+                    phases.append(
+                        LinearLR(ctx.optimizer, 1.0, min_lr / max_lr, cfg.wsd_decay_steps)
+                    )
+                case "cosine":
+                    phases.append(CosineAnnealingLR(ctx.optimizer, cfg.wsd_decay_steps, min_lr))
+                case _:
+                    raise ValueError(f"Unknown wsd_decay_type: {cfg.wsd_decay_type!r}")
+            milestones.append(warmup_steps + stable_steps)
         case _:
             raise ValueError(f"Unknown scheduler: {cfg.scheduler!r}")
-    ctx.scheduler = SequentialLR(ctx.optimizer, [warmup, stable], [warmup_steps])
+    ctx.scheduler = SequentialLR(ctx.optimizer, phases, milestones)
 
 
 @contextmanager
