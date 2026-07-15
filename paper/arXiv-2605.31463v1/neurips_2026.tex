@@ -1,0 +1,127 @@
+\documentclass{article}
+
+% if you need to pass options to natbib, use, e.g.:
+%     \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2026
+
+% The authors should use one of these tracks.
+% Before accepting by the NeurIPS conference, select one of the options below.
+% 0. "default" for submission
+% \usepackage{neurips_2026}
+% the "default" option is equal to the "main" option, which is used for the Main Track with double-blind reviewing.
+% 1. "main" option is used for the Main Track
+%  \usepackage[main]{neurips_2026}
+% 2. "position" option is used for the Position Paper Track
+%  \usepackage[position]{neurips_2026}
+% 3. "eandd" option is used for the Evaluations & Datasets Track
+ % \usepackage[eandd]{neurips_2026}
+ % if you need to opt-in for a single-blind submission in the E&D track:
+ %\usepackage[eandd, nonanonymous]{neurips_2026}
+% 4. "creativeai" option is used for the Creative AI Track
+%  \usepackage[creativeai]{neurips_2026}
+% 5. "sglblindworkshop" option is used for the Workshop with single-blind reviewing
+ % \usepackage[sglblindworkshop]{neurips_2026}
+% 6. "dblblindworkshop" option is used for the Workshop with double-blind reviewing
+%  \usepackage[dblblindworkshop]{neurips_2026}
+
+% After being accepted, the authors should add "final" behind the track to compile a camera-ready version.
+% 1. Main Track
+ % \usepackage[main, final]{neurips_2026}
+% 2. Position Paper Track
+%  \usepackage[position, final]{neurips_2026}
+% 3. Evaluations & Datasets Track
+ % \usepackage[eandd, final]{neurips_2026}
+% 4. Creative AI Track
+%  \usepackage[creativeai, final]{neurips_2026}
+% 5. Workshop with single-blind reviewing
+%  \usepackage[sglblindworkshop, final]{neurips_2026}
+% 6. Workshop with double-blind reviewing
+%  \usepackage[dblblindworkshop, final]{neurips_2026}
+% Note. For the workshop paper template, both \title{} and \workshoptitle{} are required, with the former indicating the paper title shown in the title and the latter indicating the workshop title displayed in the footnote.
+% For workshops (5., 6.), the authors should add the name of the workshop, "\workshoptitle" command is used to set the workshop title.
+% \workshoptitle{WORKSHOP TITLE}
+
+% "preprint" option is used for arXiv or other preprint submissions
+\usepackage[preprint]{neurips_2026}
+
+% to avoid loading the natbib package, add option nonatbib:
+%    \usepackage[nonatbib]{neurips_2026}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{xspace}
+\usepackage{graphicx}       % include figures
+\usepackage{pifont}         % \ding{...} marks for tables
+\usepackage[nointegrals]{wasysym}  % \LEFTcircle for partial-state mark
+\usepackage{caption}        % \captionof for side-by-side table+figure floats
+\usepackage{subcaption}     % subfigures with sub-captions
+\usepackage{array}          % >{\raggedright\arraybackslash} for tabular columns
+\usepackage{multirow}       % \multirow{} for vertically-spanned table cells
+\usepackage{makecell}       % \makecell{} for multi-line table cells with proper line spacing
+\usepackage{longtable}
+
+% Note. For the workshop paper template, both \title{} and \workshoptitle{} are required, with the former indicating the paper title shown in the title and the latter indicating the workshop title displayed in the footnote. 
+\newcommand{\sys}{PithTrain\xspace}
+\newcommand{\sysbench}{ATE-Bench\xspace}
+\title{\sys: A Compact and Agent-Native \\ MoE Training System}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+\author{
+  \textbf{Ruihang Lai}\textsuperscript{1}\thanks{Equal contribution} \quad
+  \textbf{Hao Kang}\textsuperscript{1}$^*$ \quad
+  \textbf{Haozhan Tang}\textsuperscript{1} \quad
+  \textbf{Akaash R. Parthasarathy}\textsuperscript{1} \quad \\
+  \textbf{Zichun Yu}\textsuperscript{1} \quad
+  \textbf{Junru Shao}\textsuperscript{3} \quad
+  \textbf{Todd C. Mowry}\textsuperscript{1} \quad
+  \textbf{Chenyan Xiong}\textsuperscript{1,2}\thanks{Equal advising} \quad
+  \textbf{Tianqi Chen}\textsuperscript{1,3}$^\dagger$ \quad \\
+  \textsuperscript{1}Carnegie Mellon University \quad
+  \textsuperscript{2}Xlue \quad
+  \textsuperscript{3}NVIDIA \quad
+}
+
+\begin{document}
+
+\input{sections/99_macros}
+
+\maketitle
+
+\input{sections/00_abstract}
+\input{sections/01_introduction}
+\input{sections/02_related_work}
+\input{sections/03_pithtrain}
+\input{sections/04_benchmark}
+\input{sections/05_evaluation}
+\input{sections/06_conclusion}
+
+\begin{ack}
+\sys is developed by contributors from CMU. We thank the CMU Foundation and
+Language Model (FLAME) Center for providing the compute resources to develop
+\sys. We also acknowledge the support of DGX B200 from NVIDIA.
+\end{ack}
+
+
+\bibliography{reference}
+\bibliographystyle{plain}
+
+
+\input{sections/98_appendix}
+
+
+\end{document}

@@ -1,0 +1,27 @@
+
+\begin{abstract}
+Mixture-of-Experts (MoE) has become the dominant architecture for
+frontier language models.
+To meet this demand, production frameworks have built optimized
+MoE training stacks over years of engineering effort.
+Yet evolving these stacks for new architectures and system
+optimizations remains expensive.
+With the rise of AI coding agents, they could automate parts of
+training-framework development and accelerate this evolution.
+But applying them to these existing frameworks carries hidden
+costs, invisible to today's throughput-only evaluations.
+We name this missing dimension agent-task efficiency (ATE): the
+cost of using coding agents to understand, operate, and extend a
+framework.
+Grounded in four agent-native design principles, we build \sys,
+a compact, agent-native MoE training framework.
+We further introduce \sysbench, covering real-world
+training-framework tasks.
+Our evaluation shows \sys matches the throughput of production
+frameworks, and on \sysbench, \sys enables higher agent-task
+efficiency, with up to 62\% fewer Agent Turns and 64\%
+less Active GPU Time.
+
+\vspace{1ex}
+\noindent \textbf{GitHub repo:} \url{https://github.com/mlc-ai/pith-train}
+\end{abstract}

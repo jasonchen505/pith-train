@@ -1,0 +1,45 @@
+\section{Related Work}
+\label{sec:related}
+
+Mature production frameworks have driven large-scale MoE training.
+\megatron~\cite{shoeybi2020megatronlmtrainingmultibillionparameter,narayanan2021efficientlargescalelanguagemodel}
+established the pipeline-parallel Transformer recipe most
+subsequent frameworks build on, and
+\deepspeed~\cite{deepspeed,rajbhandari2020zeromemoryoptimizationstraining}
+introduced ZeRO sharded-optimizer techniques. Both rely on
+layered designs with plugin systems, registry-based indirection,
+and compiled extension chains, delivering broad model coverage
+and peak throughput on production hardware.
+\torchtitan~\cite{liang2025torchtitanonestoppytorchnative} more
+recently scaled PyTorch-native training to multi-thousand-GPU
+clusters, sharing \sys's Python-native goal but without making
+agent-native design a primary axis or matching production-framework
+throughput on our configurations. \sys takes a different point on
+this tradeoff curve with agent-native design as a first-class
+goal, achieving higher agent-task efficiency along Agent Turns,
+Output Tokens, etc., while matching the training throughput of
+production frameworks.
+
+AI coding agents combine a tool-using language model with a small,
+stable vocabulary of primitives (read, edit, shell, search).
+Recent work designs better agent flows and harnesses for software
+engineering on top of these
+primitives~\cite{yao2023react,yang2024sweagentagentcomputerinterfacesenable,zhang2024autocoderoverautonomousprogramimprovement}.
+\sys takes a complementary direction: rather than improving the
+agent flow, we design the software framework so that existing
+flows work better, lowering agent cost without changing the agent.
+
+Existing agent benchmarks score capability on fixed codebases and
+tasks: SWE-bench~\cite{jimenez2024swebench} on GitHub-issue
+resolution, MLE-bench~\cite{chan2025mlebench} on Kaggle-style ML
+engineering, and
+HumanEval~\cite{chen2021evaluatinglargelanguagemodels} on
+function-level code generation. Closer to ML systems engineering,
+FlashInfer-Bench~\cite{xing2026flashinferbenchbuildingvirtuouscycle}
+and KernelBench~\cite{ouyang2025kernelbench} target inference
+operators and GPU kernels respectively. The agent is the variable;
+aggregate task correctness is the metric. \sysbench inverts this: holding
+the agent and task fixed, we vary the training framework so
+that differences in agent cost and task outcome isolate framework
+design. This axis is complementary to
+existing capability benchmarks.
