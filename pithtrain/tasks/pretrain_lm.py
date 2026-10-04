@@ -1,107 +1,103 @@
-"""Pretrain a language model."""
+"""
+Pretrain a language model.
+"""
 
 import gc
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.cuda
-import torch.distributed.checkpoint as dcp
-import torch.nn as nn
 import wandb
-from torch.distributed._tensor import DTensor
-from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_state_dict,
-    set_model_state_dict,
-    set_state_dict,
-)
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
+from pithtrain.contexts import distributed, logging, training
 from pithtrain.modules.checkpoint import (
-    to_canonical_model,
-    to_canonical_optim,
-    to_localized_model,
-    to_localized_optim,
+    find_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
-from pithtrain.modules.logging import LoggingCfg, LoggingCtx, activate_wandb, logging_context
-from pithtrain.modules.training import TrainingCfg, TrainingCtx, training_context
+from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
+from pithtrain.modules.optimizer import clip_grad_norm
+from pithtrain.modules.training import TrainingCfg, setup_training
+from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
+from pithtrain.pipeline import Microbatch
 
 
 @dataclass(init=False, slots=True)
 class PretrainLMCfg(SlottedDefault):
-    """Configuration for pretraining a language model."""
+    """
+    Configuration for pretraining a language model.
+    """
 
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
-    """Distributed training configuration."""
+    """
+    Distributed training configuration.
+    """
 
     training: TrainingCfg = field(default_factory=TrainingCfg)
-    """Training configuration including model, optimizer, and dataset settings."""
+    """
+    Model, optimizer, scheduler and checkpointing configuration.
+    """
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
-    """Logging configuration."""
+    """
+    Logging configuration.
+    """
+
+    dataset: Path
+    """
+    The root directory hosting the tokenized corpus, globbed for *.bin shards.
+    """
 
 
-@dataclass(init=False, slots=True)
-class PretrainLMCtx(SlottedDefault):
-    """Context for pretraining a language model."""
-
-    logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """Active logging context."""
-
-    distributed: DistributedCtx = field(default_factory=DistributedCtx)
-    """Active distributed context."""
-
-    training: TrainingCtx = field(default_factory=TrainingCtx)
-    """Active training context."""
+def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset:
+    """
+    Build the shuffled concatenation of every tokenized shard under the corpus root.
+    """
+    files = sorted(cfg.dataset.rglob("*.bin"))
+    memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
+    dataset = ConcatDataset(memmaps, cfg.training.seed)
+    required = cfg.training.max_steps * cfg.training.global_batch_size
+    assert len(dataset) >= required, f"corpus has {len(dataset)} samples, run needs {required}"
+    return dataset
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg, ctx: PretrainLMCtx, device: torch.device
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
-    if ctx.distributed.pp_rank != 0:
-        return None, None
+    cfg: PretrainLMCfg, dataset: ConcatDataset, step: int, device: torch.device
+) -> List[Microbatch]:
+    """
+    Gather the portion of the global batch belonging to this rank, already split into micro-batches.
 
+    dp_rank alone decides which data this rank loads: the expert rank names the experts a rank
+    hosts, never the data it sees. Every pipeline rank loads the same samples, since the offsets
+    below follow the step and the data and context ranks and never the pipeline rank, so each
+    builds an identical list and DualPipeV needs no broadcast to learn the shapes. Only the first
+    rank consumes the tensors, since under the V-shape it holds both the embedding and the loss.
+    """
     # short-hands
-    step = ctx.training.step
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
-    dp_size = ctx.distributed.dp_size
-    dp_rank = ctx.distributed.dp_rank
-    ep_size = ctx.distributed.ep_size
-    ep_rank = ctx.distributed.ep_rank
+    dp_size = distributed.dp_size
+    dp_rank = distributed.dp_rank
     sequence_length = cfg.training.sequence_length
-    dataset = ctx.training.dataset
 
     # arithmetic for dataset indices
-    effective_batch_size = micro_batch_size * dp_size * ep_size
-    local_batch_size = global_batch_size // (dp_size * ep_size)
-    start0 = step * global_batch_size + (dp_rank * ep_size + ep_rank) * micro_batch_size
+    effective_batch_size = micro_batch_size * dp_size
+    local_batch_size = global_batch_size // dp_size
+    start0 = step * global_batch_size + dp_rank * micro_batch_size
 
-    # Zigzag context-parallel sharding. We split the global sequence into
-    # 2*cp_size equal chunks and assign rank r the pair (r, 2*cp_size-r-1).
-    # The local sequence is the concatenation of the "front" chunk and the
-    # mirror "back" chunk, balancing the causal workload across CP ranks
-    # (see pithtrain/operators/ring_attention.py for the matching attention
-    # implementation). For cp_size == 1 this reduces to a contiguous read.
-    cp_size = ctx.distributed.cp_size
-    cp_rank = ctx.distributed.cp_rank
-    block = sequence_length // (2 * cp_size)
+    # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
+    front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
+    block = len(front)
     local_seq_len = 2 * block
-    front_offset = cp_rank * block
-    back_offset = (2 * cp_size - cp_rank - 1) * block
 
     # single allocation on host, then one HtoD transfer per tensor
     local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
@@ -113,8 +109,8 @@ def get_global_batch(
     for k in range(local_batch_size):
         acc, off = divmod(k, micro_batch_size)
         index = start0 + acc * effective_batch_size + off
-        tokens_a, labels_a = dataset.get_chunk(index, front_offset, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back_offset, block)
+        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
+        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
         local_tokens[k, :block] = tokens_a
         local_tokens[k, block:] = tokens_b
         local_labels[k, :block] = labels_a
@@ -123,226 +119,50 @@ def get_global_batch(
     local_tokens = local_tokens.to(device, non_blocking=True)
     local_labels = local_labels.to(device, non_blocking=True)
 
-    return local_tokens, local_labels
-
-
-def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    output = output.view(-1, output.size(-1))
-    target = target.view(-1)
-    return cross_entropy(output, target, ignore_index=-100)
-
-
-@torch.no_grad()
-def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
-    """
-    Clip gradients by global norm across all ranks (FSDP + pipeline).
-    Returns the total gradient norm before clipping.
-    """
-    grads = []
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad
-        if isinstance(g, DTensor):
-            g = g.to_local()
-        grads.append(g)
-    if not grads:
-        first_param = next(model.parameters(), None)
-        device = first_param.device if first_param is not None else torch.device("cpu")
-        return torch.tensor(0.0, device=device)
-    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
-    # Global L2 norm: all-reduce sum of squared norms across all ranks (FSDP + pipeline).
-    local_norm_sq = local_norm**norm_type
-    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
-    total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
-    clip_coef = (max_norm / total_norm).clamp(max=1.0)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(clip_coef)
-    return total_norm
-
-
-class AppState(Stateful):
-    """Stateful object to save and load the checkpoint."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        optimizers: tuple[Optimizer, ...],
-        schedulers: tuple[LRScheduler, ...],
-        model_only: bool = False,
-    ):
-        self.model = model
-        self.optimizers = optimizers
-        self.schedulers = schedulers
-        self.model_only = model_only
-
-    def state_dict(self):
-        """
-        Serialize the model, optimizer, and scheduler to a state dictionary.
-
-        Both model and optimizer states are converted to canonical (PP-independent) format:
-        the module.{N}. prefix is stripped so FQNs use global layer IDs (e.g.
-        layers.0.weight), and stacked expert weights are expanded to individual
-        expert tensors with global IDs.
-
-        When ``model_only`` is set (e.g. loading a checkpoint converted from
-        HuggingFace that has no optimizer/scheduler), only model keys are
-        advertised so DCP's planner does not look for missing optimizer keys.
-        """
-        if self.model_only:
-            model_state, _ = get_state_dict(self.model, self.optimizers)
-            return {"model": to_canonical_model(model_state, self.model)}
-        model_state, optim_state = get_state_dict(self.model, self.optimizers)
-        model_state = to_canonical_model(model_state, self.model)
-        optim_state = to_canonical_optim(optim_state, self.model)
-        sched_state = [s.state_dict() for s in self.schedulers]
-        return {"model": model_state, "optimizer": optim_state, "scheduler": sched_state}
-
-    def load_state_dict(self, state_dict):
-        """
-        Restore the model, optimizer, and scheduler from the checkpoint.
-
-        Canonical (PP-independent) FQNs are mapped back to local FQNs using the
-        current model structure.  The optimizer param_groups are rebuilt from
-        the current model so that DCP's cross-rank deduplication of non-tensor
-        metadata does not cause FQN mismatches.
-
-        Released checkpoints from HuggingFace may not necessarily include the states of the
-        optimizer and scheduler, so we skip the loading of these states if they are missing.
-        """
-        model_state = to_localized_model(state_dict["model"], self.model)
-        optim_state = state_dict.get("optimizer")
-        sched_state = state_dict.get("scheduler")
-
-        if optim_state:
-            optim_state = to_localized_optim(optim_state, self.model, self.optimizers)
-            kwargs = dict(model_state_dict=model_state, optim_state_dict=optim_state)
-            set_state_dict(self.model, self.optimizers, **kwargs)
-        else:
-            options = StateDictOptions(strict=False)
-            set_model_state_dict(self.model, model_state, options=options)
-        if sched_state:
-            if isinstance(sched_state, dict):  # legacy single-scheduler ckpt
-                sched_state = [sched_state]
-            for scheduler, st in zip(self.schedulers, sched_state):
-                scheduler.load_state_dict(st)
-
-
-def raise_if_dataset_insufficient(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
-    """Raise if configured run requires more samples than available in dataset."""
-    global_batch_size = cfg.training.global_batch_size
-    max_steps = cfg.training.max_steps
-
-    assert global_batch_size > 0, f"{global_batch_size=}"
-
-    required_samples = max_steps * global_batch_size
-    dataset_size = len(ctx.training.dataset)
-
-    if dataset_size >= required_samples:
-        return
-
-    message = (
-        "Dataset is too small for this run: available-samples=%s, required-samples=%s "
-        "(max_steps=%s x global_batch_size=%s)."
-        % (
-            format(dataset_size, ","),
-            format(required_samples, ","),
-            format(max_steps, ","),
-            format(global_batch_size, ","),
+    # Rows are already micro-batch major, so a plain split reproduces the partitioning the pipeline
+    # applies itself: rows [i * mbs, (i + 1) * mbs) belong to micro-batch i.
+    return [
+        Microbatch(
+            model_inputs=(local_tokens[i : i + micro_batch_size],),
+            cu_seqlens=None,
+            objective_inputs=(local_labels[i : i + micro_batch_size],),
         )
-    )
-    if ctx.distributed.rank == 0:
-        raise RuntimeError(message)
-    raise SystemExit(1)
+        for i in range(0, local_batch_size, micro_batch_size)
+    ]
 
 
-def save_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
+def objective(
+    model_outputs: Tuple[torch.Tensor, ...],
+    objective_inputs: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Save the checkpoint at the current step.
+    Cross-entropy objective for language-model pretraining.
 
-    Uses cpu_offload=True (with the default full_state_dict=False)
-    so that each rank's local FSDP shards are moved to CPU -- no GPU
-    all-gather is performed.  Expert DTensors are split into per-expert
-    entries locally (via unwrap_dtensor_experts in resharding.py),
-    so each rank writes only the expert keys it owns.  Non-expert
-    DTensors are kept as CPU DTensors and DCP saves each rank's shard.
+    Returns the loss summed over the tokens of this micro-batch, so gradients accumulate across
+    micro-batches; the training step divides by the global non-ignored token count for a correct
+    token-weighted mean. The second return value is the same loss detached, which the step
+    reduces the same way to log the training loss.
     """
-    stdout = ctx.logging.stdout
-    assert cfg.training.save_location is not None
-    save_location = Path(cfg.training.save_location, "torch-dcp", "step-%08d" % ctx.training.step)
-    model = ctx.training.model
-    optimizers = ctx.training.optimizers
-    schedulers = ctx.training.schedulers
-
-    options = StateDictOptions(cpu_offload=True)
-    model_state, optim_state = get_state_dict(model, optimizers, options=options)
-    state_dict = dict()
-    state_dict["app"] = dict()
-    state_dict["app"]["model"] = to_canonical_model(model_state, model)
-    state_dict["app"]["optimizer"] = to_canonical_optim(optim_state, model)
-    state_dict["app"]["scheduler"] = [s.state_dict() for s in schedulers]
-
-    stdout.info("Save checkpoint: %s" % save_location)
-    t0 = time.monotonic()
-    gc.collect()
-    torch.cuda.empty_cache()
-    dcp.save(state_dict, checkpoint_id=save_location)
-    rank = torch.distributed.get_rank()
-    rng_path = Path(save_location, "rng-rank-%05d.pt" % rank)
-    torch.save(torch.cuda.get_rng_state(), rng_path)
-    dt = torch.tensor(time.monotonic() - t0, device="cuda")
-    dt_min, dt_max = dt.clone(), dt.clone()
-    torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
-    torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)
-    stdout.info("Save checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
+    (logits,) = model_outputs
+    (labels,) = objective_inputs
+    logits = logits.view(-1, logits.size(-1))
+    labels = labels.view(-1)
+    n_tokens = (labels != -100).sum().clamp_min(1)
+    loss = cross_entropy(logits, labels, ignore_index=-100) * n_tokens
+    return loss, loss.detach()
 
 
-def load_checkpoint(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
-    """Load the checkpoint from the latest step."""
-    stdout = ctx.logging.stdout
-    if cfg.training.save_location is None:
-        stdout.info("No save_location set; training from scratch.")
-        return
-    path2step = lambda p: int(p.stem.removeprefix("step-"))
-    checkpoints = Path(cfg.training.save_location, "torch-dcp").glob("step-*")
-    checkpoints = sorted(checkpoints, key=path2step)
-    if not checkpoints:
-        stdout.info("No checkpoint found; training from scratch.")
-        return
-    load_location = checkpoints.pop()
-    stdout.info("Load checkpoint: %s" % load_location)
-    t0 = time.monotonic()
-    torch.cuda.empty_cache()
-    metadata = FileSystemReader(str(load_location)).read_metadata()
-    model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
-    model = ctx.training.model
-    optimizers, schedulers = ctx.training.optimizers, ctx.training.schedulers
-    app_state = AppState(model, optimizers, schedulers, model_only=model_only)
-    dcp.load({"app": app_state}, checkpoint_id=load_location)
-    rank = torch.distributed.get_rank()
-    rng_path = Path(load_location, "rng-rank-%05d.pt" % rank)
-    if rng_path.exists():
-        rng_state = torch.load(rng_path, weights_only=True)
-        torch.cuda.set_rng_state(rng_state)
-    ctx.training.step = path2step(load_location)
-    dt = torch.tensor(time.monotonic() - t0, device="cuda")
-    dt_min, dt_max = dt.clone(), dt.clone()
-    torch.distributed.all_reduce(dt_min, op=torch.distributed.ReduceOp.MIN)
-    torch.distributed.all_reduce(dt_max, op=torch.distributed.ReduceOp.MAX)
-    stdout.info("Load checkpoint: Elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
-
-
-def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
-    """Execute one step of training."""
+def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
+    """
+    Execute one step of training.
+    """
     # Start the nsys and the memory profiler.
     start = cfg.training.nsys_start
-    if start is not None and ctx.training.step == start:
+    if start is not None and step == start:
         torch.cuda.cudart().cudaProfilerStart()
         # Pushed right after cudaProfilerStart so it is the earliest in-window NVTX per globalTid
         # (enables pid to mesh-coord lookup); range, not mark, so nsys-ui renders on the thread row.
-        d, t, parts = ctx.distributed, cfg.training, list()
+        d, t, parts = distributed, cfg.training, list()
         parts.append(f"rank={d.rank}")
         parts.append(
             f"pp={d.pp_rank}/{d.pp_size} dp={d.dp_rank}/{d.dp_size} "
@@ -351,7 +171,7 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         parts.append(f"mbs={t.micro_batch_size} seq={t.sequence_length}")
         torch.cuda.nvtx.range_push("; ".join(parts))
     start = cfg.training.memory_profile_start
-    if start is not None and ctx.training.step == start:
+    if start is not None and step == start:
         torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
@@ -359,46 +179,52 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
 
     torch.cuda.memory.reset_peak_memory_stats()
 
-    model = ctx.training.model
-    optimizers = ctx.training.optimizers
-    schedulers = ctx.training.schedulers
+    model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     model.train()
 
-    dp_size = ctx.distributed.dp_size
-    ep_size = ctx.distributed.ep_size
+    dp_size = distributed.dp_size
     micro_batch_size = cfg.training.micro_batch_size
     global_batch_size = cfg.training.global_batch_size
-    assert global_batch_size % (micro_batch_size * dp_size * ep_size) == 0
+    assert global_batch_size % (micro_batch_size * dp_size) == 0
 
-    # Gather the data for this rank's portion of the global batch.
-    accumulate_steps = global_batch_size // (micro_batch_size * dp_size * ep_size)
-    global_tokens, global_labels = get_global_batch(cfg, ctx, device)
+    # Gather the part of the global batch this rank owns, split into micro-batches.
+    microbatches = get_global_batch(cfg, dataset, step, device)
 
-    # Run the forward and backward pass.
-    loss, _ = model.step(
-        global_tokens,
-        num_chunks=accumulate_steps,
-        criterion=criterion,
-        labels=(global_labels,),
-        return_outputs=False,
-    )
+    # Run the forward and backward pass. The objective hands back one detached loss per
+    # micro-batch on pipeline rank 0; every other rank gets an empty list.
+    objective_outputs = model.step(microbatches, objective)
 
-    # Average loss across CP ranks for correct logging.
-    cp_size = ctx.distributed.cp_size
-    if loss is not None and cp_size > 1:
-        cp_group = ctx.distributed.device_mesh.get_group("cp")
-        torch.distributed.all_reduce(loss, group=cp_group)
-        loss /= cp_size
+    # Token-weighted reduction. The objective returns a loss summed over the tokens of each
+    # micro-batch, so dividing by the total non-ignored token count yields the correct token-mean
+    # regardless of how tokens split across micro-batches. Every rank holds the same labels, so
+    # each counts the same total for the gradient scale.
+    counted = 0
+    for mb in microbatches:
+        (labels,) = mb.objective_inputs
+        counted = counted + (labels != -100).sum()
+    num_tokens = counted.clamp_min(1).to(device=device, dtype=torch.float32)
 
-    # Scale gradients back so the effective loss is the mean over chunks.
-    if accumulate_steps > 1:
-        scale = 1.0 / accumulate_steps
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(scale)
+    cp_size = distributed.cp_size
+    if distributed.pp_rank == 0:
+        loss = torch.stack(objective_outputs).sum() / num_tokens
+        if cp_size > 1:
+            torch.distributed.all_reduce(loss, group=distributed.cp_group)
+            loss /= cp_size
+
+    # The one gradient normalization. FSDP reduces with a plain sum (see apply_fsdp), so dividing
+    # by the global token count leaves every parameter, attn or expt, at the token-weighted mean.
+    # Tokens split dp ways across the batch and cp ways along the sequence, so the global count
+    # is the local count times dp * cp, which holds only while every rank counts the same number
+    # of tokens: true for pretraining, not for packed data with -100 masks.
+    scale = 1.0 / (num_tokens * distributed.dp_size * distributed.cp_size)
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.mul_(scale)
 
     # Clip the gradients.
-    gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
+    gradient_norm = clip_grad_norm(
+        model, max_norm=1.0, norm_type=2, hsdp_replica=cfg.distributed.hsdp_replica
+    )
 
     # Take an optimization step (composed optimizers + their schedulers).
     for optimizer, scheduler in zip(optimizers, schedulers):
@@ -432,11 +258,10 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         lb_loss = 0.0
 
     # Print the loss and learning rate on rank 0.
-    logger = ctx.logging.stdout
-    if ctx.distributed.rank == 0:
-        step = ctx.training.step
+    logger = logging.stdout
+    if distributed.rank == 0:
         max_steps = cfg.training.max_steps
-        loss, lr = torch.mean(loss).item(), schedulers[0].get_last_lr()[0]
+        loss, lr = loss.item(), schedulers[0].get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
         statements = []
         statements.append("step %08d/%08d" % (step + 1, max_steps))
@@ -450,8 +275,8 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         logger.info(" | ".join(statements))
         # Lazily initialize WandB on the first successful step.
-        activate_wandb(cfg, ctx)
-        if ctx.logging.wandb is not None:
+        activate_wandb(cfg)
+        if logging.wandb is not None:
             metrics = dict()
             metrics["train/step"] = step
             metrics["train/cross-entropy-loss"] = loss
@@ -464,17 +289,17 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)
 
-    # Increment the step counter.
-    ctx.training.step += 1
+    # Everything below counts completed steps, one more than the index of the step just run.
+    completed = step + 1
 
     # Stop the nsys and the memory profiler.
     stop = cfg.training.nsys_stop
-    if stop is not None and ctx.training.step == stop:
+    if stop is not None and completed == stop:
         torch.cuda.nvtx.range_pop()
         torch.cuda.cudart().cudaProfilerStop()
     stop = cfg.training.memory_profile_stop
-    if stop is not None and ctx.training.step == stop:
-        rank = ctx.distributed.rank
+    if stop is not None and completed == stop:
+        rank = distributed.rank
         cfg.training.memory_profile_output.mkdir(parents=True, exist_ok=True)
         path = Path(cfg.training.memory_profile_output, "snapshot-rank%05d.pickle" % rank)
         torch.cuda.memory._dump_snapshot(str(path))
@@ -486,10 +311,11 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     # Skip entirely if save_interval is None.
     if cfg.training.save_interval is not None:
         should_save = False
-        should_save |= ctx.training.step % cfg.training.save_interval == 0
-        should_save |= ctx.training.step == cfg.training.max_steps
+        should_save |= completed % cfg.training.save_interval == 0
+        should_save |= completed == cfg.training.max_steps
         if should_save:
-            save_checkpoint(cfg, ctx)
+            assert cfg.training.save_location is not None
+            save_checkpoint(cfg.training.save_location, completed)
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
     gc.collect()
@@ -497,15 +323,21 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
 
 @record
 def launch(cfg: PretrainLMCfg) -> None:
-    """Launch the pretraining of a language model."""
-    with ExitStack() as stack:
-        ctx = PretrainLMCtx()
-        stack.enter_context(logging_context(cfg, ctx))
-        stack.enter_context(distributed_context(cfg, ctx))
-        stack.enter_context(training_context(cfg, ctx))
-        logger = ctx.logging.stdout
-        logger.info("launch(cfg=%s)" % cfg)
-        load_checkpoint(cfg, ctx)
-        raise_if_dataset_insufficient(cfg, ctx)
-        while ctx.training.step < cfg.training.max_steps:
-            train_step(cfg, ctx)
+    """
+    Launch the pretraining of a language model.
+    """
+    setup_logging(cfg)
+    setup_distributed(cfg)
+    dataset = setup_dataset(cfg)
+    setup_training(cfg)
+    logger = logging.stdout
+    logger.info("launch(cfg=%s)" % cfg)
+    step = find_checkpoint(cfg.training.save_location)
+    if step is not None:
+        load_checkpoint(cfg.training.save_location, step)
+    step = step or 0
+    gc.disable()
+    while step < cfg.training.max_steps:
+        train_step(cfg, dataset, step)
+        step += 1
+    gc.enable()

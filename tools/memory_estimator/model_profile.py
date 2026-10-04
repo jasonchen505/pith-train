@@ -59,7 +59,13 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class ParallelismConfig:
-    """Parallelism and training configuration."""
+    """
+    Parallelism and training configuration.
+
+    dp_size is the attention data-parallel degree, how many ways the global batch is split. It
+    and cp_size factor the ranks of one pipeline stage; ep_size re-factors the same ranks against
+    expt_dp_size.
+    """
 
     pp_size: int
     ep_size: int
@@ -70,12 +76,33 @@ class ParallelismConfig:
     sequence_length: int
     fp8_training: str = "disabled"
 
+    def __post_init__(self) -> None:
+        if self.stage_size % self.ep_size != 0:
+            raise ValueError(
+                f"dp_size * cp_size ({self.stage_size}) must be divisible by "
+                f"ep_size ({self.ep_size})"
+            )
+
+    @property
+    def stage_size(self) -> int:
+        """
+        Ranks holding one pipeline stage: dp * cp == ep * expt_dp.
+        """
+        return self.dp_size * self.cp_size
+
+    @property
+    def expt_dp_size(self) -> int:
+        """
+        Expert data parallel: how many replicas of the sharded expert set exist.
+        """
+        return self.stage_size // self.ep_size
+
 
 def compute_layer_distribution(num_hidden_layers: int, num_stages: int) -> list[int]:
     """
     Distribute decoder layers across pipeline stages.
 
-    Matches the algorithm in pithtrain/dualpipe/layer_partition.py:
+    Matches the algorithm in pithtrain/pipeline/dualpipev.py:
     even base allocation, remainder layers go to inner stages first
     (edges stay light to compensate for embed/head overhead).
     """
@@ -227,12 +254,14 @@ class ModelMemoryProfile:
         return ".mlp.experts." in spec.name
 
     def _fsdp_shard_world(self, spec: TensorSpec) -> int:
-        """FSDP shard world size for a parameter."""
+        """
+        FSDP shard world size for a parameter: the size of the replica group it lives in.
+
+        Expert weights replicate over expt_dp = stage // ep, everything else over the whole
+        dp x cp stage.
+        """
         pcfg = self.parallel_cfg
-        if self._is_expert_param(spec):
-            return pcfg.dp_size * pcfg.cp_size
-        else:
-            return pcfg.dp_size * pcfg.cp_size * pcfg.ep_size
+        return pcfg.expt_dp_size if self._is_expert_param(spec) else pcfg.stage_size
 
     def _fsdp_shard_size(self, spec: TensorSpec) -> int:
         """Number of FSDP-sharded elements on this rank."""

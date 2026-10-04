@@ -15,16 +15,35 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        review:
+          - { name: Correctness, slug: correctness }
+          - { name: Performance, slug: performance }
+          - { name: Compactness, slug: compactness }
+          - { name: Consistency, slug: consistency }
     steps:
-      - name: Checkout repository
+      - name: Checkout PR
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-      - name: Run Claude Code Review
-        id: claude-review
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          fetch-depth: 0
+      - name: Render ${{ matrix.review.name }} Prompt
+        id: render
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          {
+            echo "prompt<<PROMPT_EOF"
+            envsubst '${GITHUB_REPOSITORY} ${GITHUB_EVENT_ISSUE_NUMBER}' < ".github/review-prompts/${{ matrix.review.slug }}.md"
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Conduct ${{ matrix.review.name }} Review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.issue.number }} --comment'
+          prompt: ${{ steps.render.outputs.prompt }}
+          claude_args: '--model claude-opus-4-8 --effort high --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(grep:*),Read,Grep,Glob,WebFetch"'
+          show_full_output: true

@@ -1,5 +1,6 @@
 """Spawn workers and run them under PithTrain's distributed context."""
 
+import math
 import os
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ import pytest
 import torch
 from torch.multiprocessing.spawn import spawn
 
-from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
+from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 
 # Snapshot launcher-provided values at module load. Within a single pytest
 # session, multiple launch calls would otherwise pollute each other's env via
@@ -33,27 +34,24 @@ def entrypoint(i: int, cfg: DistributedCfg, worker: Callable, *args) -> None:
     os.environ["LOCAL_RANK"] = str(i)
 
     parent_cfg = SimpleNamespace(distributed=cfg)
-    parent_ctx = SimpleNamespace(distributed=DistributedCtx())
-    with distributed_context(parent_cfg, parent_ctx) as ctx:
-        worker(ctx, *args)
+    setup_distributed(parent_cfg)
+    worker(*args)
 
 
 def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
     """
-    Spawn workers and call worker(ctx, *args) inside each. Skip the test if
-    the distributed runtime cannot provide pp * cp * ep ranks.
+    Spawn workers and call worker(*args) inside each. Skip the test if the distributed
+    runtime cannot provide the ranks the mesh needs.
     """
-    mesh_extent = 1
-    mesh_extent *= cfg.pipeline_parallel_size
-    mesh_extent *= cfg.context_parallel_size
-    mesh_extent *= cfg.expert_parallel_size
+    pp_size = cfg.pipeline_parallel_size
+    stage_extent = math.lcm(cfg.context_parallel_size, cfg.expert_parallel_size)
+    mesh_extent = pp_size * stage_extent
 
     os.environ["WORLD_SIZE"] = LAUNCHER_WORLD_SIZE or str(mesh_extent)
     os.environ["LOCAL_WORLD_SIZE"] = LAUNCHER_LOCAL_WORLD_SIZE or os.environ["WORLD_SIZE"]
     os.environ.setdefault("NODE_RANK", "0")
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "15213")
-    os.environ.setdefault("TORCHELASTIC_RUN_ID", "pytest")
 
     world_size = int(os.environ["WORLD_SIZE"])
     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
@@ -62,8 +60,10 @@ def launch(cfg: DistributedCfg, worker: Callable, *args) -> None:
         pytest.skip(f"require {mesh_extent} ranks, got {world_size}")
     if torch.cuda.device_count() < local_world_size:
         pytest.skip(f"require {local_world_size} GPUs, got {torch.cuda.device_count()}")
-    if world_size % mesh_extent != 0:
-        raise ValueError(f"{world_size=} not divisible by {mesh_extent=}")
+    if world_size % pp_size != 0:
+        raise ValueError(f"{world_size=} not divisible by {pp_size=}")
+    if (world_size // pp_size) % stage_extent != 0:
+        raise ValueError(f"stage_size={world_size // pp_size} not divisible by {stage_extent=}")
     if world_size % local_world_size != 0:
         raise ValueError(f"{world_size=} not divisible by {local_world_size=}")
 

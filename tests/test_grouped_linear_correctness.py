@@ -1,17 +1,19 @@
 """
-Correctness test for F.grouped_mm and GroupLinear.
+Correctness test for F.grouped_mm and GroupedLinear.
 
 This test compares the F.grouped_mm implementation against a reference
 for-loop based matmul implementation to ensure correctness.
 """
 
+from types import SimpleNamespace
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 
-from pithtrain.layers.group_linear import GroupLinear
-from pithtrain.operators.token_scatter import _GEMM_ALLOC_ALIGNMENT, scatter_for_grouped_gemm
+from pithtrain.contexts import training
+from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 
 def reference_grouped_linear_forward(
@@ -207,8 +209,8 @@ def test_grouped_linear_backward():
         )
 
 
-def test_group_linear_module():
-    """Test GroupLinear module (wrapper around F.grouped_mm)."""
+def test_grouped_linear_module():
+    """Test GroupedLinear module (wrapper around F.grouped_mm)."""
     device = torch.device("cuda")
     dtype = torch.float32
 
@@ -219,7 +221,7 @@ def test_group_linear_module():
     out_features = 256
 
     # Create module
-    module = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    module = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
 
     # Create packed input
     M_total = sum(group_sizes)
@@ -332,8 +334,7 @@ def _verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out, reverse_
     1. grouped_mm_offs has correct shape and values (padded cumsum)
     2. reverse_idxs correctly maps: out[reverse_idxs[i]] == sorted_tokens[i]
     3. Within each expert group, the correct set of token rows exists
-    4. Padding rows are all zeros
-    5. Rows beyond offs[-1] (over-allocation) are all zeros
+    4. Padding rows within each expert group are all zeros
     """
     # Check reverse_idxs recovers original tokens
     recovered = out[reverse_idxs]
@@ -401,22 +402,36 @@ def test_scatter_for_grouped_gemm():
         assert offs_new.shape == (num_groups,), f"offs shape {offs_new.shape} != ({num_groups},)"
         assert offs_new.dtype == torch.int32
 
-        # Verify output shape: over-allocated up to _GEMM_ALLOC_ALIGNMENT for
-        # allocator-friendliness, and rows in [offs[-1], out.shape[0]) zeroed
-        # by the scatter kernel so downstream grouped_mm is safe.
-        m_padded = offs_new[-1].item()
-        assert out_new.shape[0] >= m_padded, f"output rows {out_new.shape[0]} < offs[-1]={m_padded}"
-        assert out_new.shape[0] % _GEMM_ALLOC_ALIGNMENT == 0, (
-            f"output rows {out_new.shape[0]} not aligned to {_GEMM_ALLOC_ALIGNMENT}"
+        # The allocation is rounded up internally, but the public result is
+        # narrowed to the sum of per-expert padded token counts. Derive that
+        # contract from the input assignments, independently of the kernel.
+        counts = torch.bincount(expert_idxs, minlength=num_groups).tolist()
+        expected_ks = [
+            (count + padding_alignment - 1) // padding_alignment * padding_alignment
+            for count in counts
+        ]
+        expected_ks_tensor = torch.tensor(expected_ks, device=device, dtype=torch.int32)
+        expected_offs = expected_ks_tensor.cumsum(0, dtype=torch.int32)
+        assert ks_new == expected_ks, f"{test_name}: incorrect per-expert sizes"
+        assert torch.equal(ks_tensor_new, expected_ks_tensor), (
+            f"{test_name}: ks_tensor (per-expert padded sizes) mismatch: "
+            f"actual={ks_tensor_new.tolist()}, expected={expected_ks}"
         )
-        assert out_new.shape[1] == hidden_size, (
-            f"output cols {out_new.shape[1]} != hidden_size={hidden_size}"
+        assert torch.equal(offs_new, expected_offs), (
+            f"{test_name}: grouped_mm_offs (cumulative padded offsets) mismatch: "
+            f"actual={offs_new.tolist()}, expected={expected_offs.tolist()}"
         )
+        m_padded = sum(expected_ks)
+        # Retain the tail check if a future implementation returns extra rows.
         if out_new.shape[0] > m_padded:
             tail = out_new[m_padded:]
             assert torch.all(tail == 0), (
-                f"over-allocated tail [{m_padded}:{out_new.shape[0]}) must be zero"
+                f"{test_name}: over-allocated tail [{m_padded}:{out_new.shape[0]}) must be zero"
             )
+        expected_shape = (m_padded, hidden_size)
+        assert out_new.shape == expected_shape, (
+            f"{test_name}: output shape {out_new.shape} != {expected_shape}"
+        )
 
         # Verify reverse_shuffle_idxs
         assert reverse_new.shape == (m,)
@@ -589,9 +604,9 @@ def test_scatter_then_grouped_mm_end_to_end():
         )
 
 
-def test_group_linear_weight_grad_store():
-    """GroupLinear correctly defers weight gradients via WeightGradStore."""
-    from pithtrain.dualpipe.utils import WeightGradStore
+def test_grouped_linear_weight_grad_store():
+    """GroupedLinear correctly defers weight gradients via WeightGradStore."""
+    from pithtrain.pipeline.execution import WeightGradStore
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -601,7 +616,7 @@ def test_group_linear_weight_grad_store():
     M_total = sum(group_sizes)
     grouped_mm_offs = torch.tensor(group_sizes, device=device).cumsum(0).to(torch.int32)
 
-    gl_ref = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    gl_ref = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
     torch.nn.init.normal_(gl_ref.weight, std=0.02)
 
     x_raw = torch.randn(M_total, in_features, device=device, dtype=dtype)
@@ -614,7 +629,7 @@ def test_group_linear_weight_grad_store():
     ref_input_grad = x_ref.grad.clone()
 
     # Deferred path.
-    gl = GroupLinear(num_groups, in_features, out_features).to(device).to(dtype)
+    gl = GroupedLinear(num_groups, in_features, out_features).to(device).to(dtype)
     gl.weight.data.copy_(gl_ref.weight.data)
     x_def = x_raw.detach().clone().requires_grad_(True)
 
@@ -644,18 +659,22 @@ def test_group_linear_weight_grad_store():
         WeightGradStore.clear()
 
 
-def test_gpt_oss_experts_weight_grad_store_matches_direct():
+def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
     """
-    End-to-end sanity check: GptOssExperts (now backed by GroupLinearFunc for
+    End-to-end sanity check: GptOssExperts (now backed by GroupedLinearFunc for
     the expert GEMMs) produces the same input / weight / bias gradients whether
     WeightGradStore is enabled or disabled.
 
     Only the expert-weight wgrad is routed through WeightGradStore; the bias
-    add lives outside GroupLinearFunc so its grad is computed eagerly via
+    add lives outside GroupedLinearFunc so its grad is computed eagerly via
     autograd on both paths.
     """
-    from pithtrain.dualpipe.utils import WeightGradStore
     from pithtrain.models.gpt_oss import GptOssExperts
+    from pithtrain.pipeline.execution import WeightGradStore
+
+    # This standalone BF16 test does not call setup_training. Restore the
+    # previous context value (or its absence) when the test finishes.
+    monkeypatch.setattr(training, "fp8", False, raising=False)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -664,6 +683,9 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     hidden_size = 128
     intermediate_size = 256
     swiglu_limit = 7.0
+    config = SimpleNamespace(
+        hidden_size=hidden_size, intermediate_size=intermediate_size, swiglu_limit=swiglu_limit
+    )
 
     # Random routing with one empty group to exercise the zero-token branch.
     group_sizes = [8, 0, 12, 4]
@@ -674,7 +696,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     torch.manual_seed(123)
     x_raw = torch.randn(M_total, hidden_size, device=device, dtype=dtype)
 
-    experts_ref = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_ref = GptOssExperts(config, num_experts)
     experts_ref = experts_ref.to(device=device, dtype=dtype)
     with torch.no_grad():
         experts_ref.gate_up_proj.normal_(std=0.02)
@@ -682,7 +704,7 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
         experts_ref.gate_up_proj_bias.normal_(std=0.02)
         experts_ref.down_proj_bias.normal_(std=0.02)
 
-    experts_def = GptOssExperts(num_experts, hidden_size, intermediate_size, swiglu_limit)
+    experts_def = GptOssExperts(config, num_experts)
     experts_def = experts_def.to(device=device, dtype=dtype)
     experts_def.load_state_dict(experts_ref.state_dict())
 
@@ -705,14 +727,14 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
 
         out_def.backward(grad)
 
-        # Expert weights go through GroupLinearFunc's deferred wgrad path.
+        # Expert weights go through GroupedLinearFunc's deferred wgrad path.
         for p_def, name in [
             (experts_def.gate_up_proj, "gate_up_proj"),
             (experts_def.down_proj, "down_proj"),
         ]:
             assert p_def.grad is None, f"[deferred] {name} grad should be deferred"
 
-        # Biases are added outside GroupLinearFunc; autograd populates them eagerly.
+        # Biases are added outside GroupedLinearFunc; autograd populates them eagerly.
         for p_def, name in [
             (experts_def.gate_up_proj_bias, "gate_up_proj_bias"),
             (experts_def.down_proj_bias, "down_proj_bias"),

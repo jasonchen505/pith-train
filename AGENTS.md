@@ -28,18 +28,18 @@ Style: 100-char line length, double quotes, `py312` target. Rules: E, F, I, W (i
 
 ```bash
 # Single-GPU unit tests (kernels, ops, layer protocol)
-pytest tests/test_fp8_quantize_kernels.py -v
+pytest tests/operators/test_deepgemm_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
 pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
-pytest tests/operators/test_ring_attention.py tests/test_layer_partition.py -v
+pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
-pytest tests/test_fp8_quantize_kernels.py::test_name -v
+pytest tests/operators/test_deepgemm_quantize.py::test_name -v
 
 # Multi-GPU integration test — boots DualPipeV with FSDP, ~4 GPUs, pp=2 ep=2
-bash tests/test_fsdp.sh
+bash tests/test_dualpipev.sh
 ```
 
 ### Benchmarks
@@ -73,7 +73,7 @@ python -m tools.memory_estimator --help   # peak-memory simulator for a given pa
 
 ## Architecture
 
-### DualPipeV Pipeline (`pithtrain/dualpipe/`)
+### DualPipeV Pipeline (`pithtrain/pipeline/`)
 
 The core pipeline assigns each rank two model chunks in a V-shape (the model is cut into `2 * pp_size` chunks; rank `r` holds chunks `r` and `2*pp_size-1-r`) and overlaps forward and backward execution across micro-batches. Each transformer layer is split into 5 stages:
 
@@ -83,47 +83,63 @@ The core pipeline assigns each rank two model chunks in a V-shape (the model is 
 4. **Combine** — All-to-all gather expert outputs (async on comm stream)
 5. **Aggregate** — Weighted expert output + residual connection
 
+Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/pipeline/execution.py`), not layer methods.
+
 Key files:
-- `dualpipev.py` — Main scheduler: `DualPipeV.step()` orchestrates overlapped F/B across modules. Supports `forward_only=True` for inference.
-- `overlap.py` — `overlapped_forward_backward()` interleaved loop for one pair of micro-batches
-- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.) and `ExecutionCtx`
-- `modeling.py` — `decoder_layer_forward/backward` autograd wrappers, dispatch/combine helpers
-- `layer_partition.py` — Distributes decoder layers across pipeline stages; edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
-- `comm.py` — P2P communication setup between pipeline ranks
-- `utils.py` — `FP8WeightCacheControl` (cache quantized weights across micro-batches), `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
+- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
+- `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, the dispatch/combine helpers, and `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
 
 ### FP8 Training
 
-`ModelImplMode.fp8_training` in `pithtrain/layers/factory.py` selects the linear-layer backend (currently `"deep-gemm"` or BF16 fallback). The DeepGEMM path (`pithtrain/layers/deepgemm_fp8_linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_fp8_quantize.py`. The BF16 grouped linear layer is in `pithtrain/layers/group_linear.py`.
+`TrainingCfg.fp8` selects the linear-layer backend: at training setup it binds `training.Linear` / `training.GroupedLinear` to the FP8 or BF16 classes. The DeepGEMM path (`pithtrain/operators/linear.py`) uses 128-element block scaling with E8M0 scale format, backed by custom Triton quantization kernels in `pithtrain/operators/deepgemm_quantize.py`. The BF16 grouped linear layer is in `pithtrain/operators/grouped_linear.py`.
 
 ### Distributed Parallelism (`pithtrain/modules/distributed.py`)
 
-Four dimensions: Pipeline Parallel (PP), Expert Parallel (EP), Context Parallel (CP, ring attention), Data Parallel (DP via FSDP2 `fully_shard`). PP/CP/EP are configured through `DistributedCfg`; DP is inferred from the world size. The `(PP, DP, CP, EP)` device mesh and process groups are built in `setup_device_mesh`/`setup_default_process_group`. The same module installs a fail-fast excepthook plus an NCCL heartbeat timeout (driven by `DistributedCfg.timeout`, default 15 min) so a failed rank does not make peers wait on the watchdog.
+**MoE parallel folding** ([arXiv:2504.14960](https://arxiv.org/abs/2504.14960) section 3.2): attention and the experts get independent parallelism over the same ranks. `setup_device_mesh` builds two device meshes, `attn_mesh` as `(pp, dp, cp)` and `expt_mesh` as `(pp, dp, ep)`, which factor the `world_size // pp` ranks of one pipeline stage two different ways, so `dp * cp == ep * expt_dp == world_size // pp`. PP is the one axis the two views share, and it stays outermost in each. PP/CP/EP are configured through `DistributedCfg`; both DP degrees are derived.
+
+Properties worth remembering: `cp` and `ep` each need only divide the stage size, not each other, so EP may span CP; both the CP group and the EP group are contiguous rank blocks, so each stays on NVLink independently; and **`dp_rank` alone decides which data a rank loads**, while `ep_rank` names only the experts a rank hosts. FSDP shards the expert parameters (the routed expert weights) over `expt_mesh["dp"]` and the attention parameters (everything else) over the flattened `attn_mesh["dp", "cp"]`, with a plain-sum gradient reduction on both, so the single divide by the global token count in the training step is the only normalization. `DistributedCfg.hsdp_replica` above 1 splits both of those groups into that many replicas, sharding within one and all-reducing across them. A process group is published only for axes that a collective runs over directly (`pp`, `cp`, `ep`); both `dp` axes reduce through FSDP, which takes a mesh.
+
+`setup_default_process_group` also installs a fail-fast excepthook and passes `DistributedCfg.timeout` (default 15 min) as the collective timeout, so a failed rank does not make peers wait. Both belong to creating the world, so a process that inherits one from its host keeps whatever that host chose.
+
+**Two CP sequence layouts (`pithtrain/operators/cp_sequence.py`).** Softmax attention shards the sequence **zigzag** (rank `r` holds blocks `r` and `2 * cp_size - r - 1` of `2 * cp_size`) to balance causal work; a linear-attention recurrence instead needs **contiguous** (blocks `2r` and `2r + 1`) so that rank order is sequence order. Hybrid models (Qwen3.5) convert with one all-to-all at each boundary between the two kinds of layer, hoisted to the ends of each run of linear-attention layers. The invariant: **hidden states are zigzag at model boundaries and at every attention layer, contiguous within a run of linear-attention layers**; norms, MoE and residuals are per-token and layout-blind. `zigzag_spans(cp_rank, cp_size, seq_len)` is the single definition of the zigzag partition, returning the two global token ranges a rank holds, and both the loader and `forward_posemb` call it. Restating that arithmetic elsewhere mistrains silently rather than raising.
 
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
-Models implement `ModelProtocol` with layers that expose `forward_attn`, `forward_mlp`, `forward_aggregate` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2_lite.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+Models implement `ModelProtocol` with layers that expose `forward_stage1`, `forward_stage3`, `forward_stage5` — matching the 5-stage split. Supported models: DeepSeek-V2-Lite (`deepseek_v2.py`), Qwen3 MoE (`qwen3_moe.py`), GPT-OSS 20B/120B (`gpt_oss.py`).
+
+### Tensor Layouts & Sequence Packing
+
+The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through embeddings, norms, attention, MoE, residuals, the P2P activations between pipeline stages, and the loss. Nothing outside attention is aware of packing.
+
+**Packed / variable-length (SFT) training** enforces `micro_batch_size == 1`. A micro-batch is `(1, S, hidden)` where `S` is the total token count and several documents are concatenated along the `S` axis; a per-sample `cu_seqlens` (int32 cumulative document offsets `[0, …, S]`) marks the boundaries. So the residual stream is semantically `TD` (`T = S` tokens × `hidden`) wearing a batch-of-one BSHD coat — kept 3-D on purpose so (a) every BSHD-assuming module (norm, MoE, embed, loss, P2P) is untouched and (b) the caller can still split the batch into micro-batches along dim 0 (the `B=1` is that seam).
+
+**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen). `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
+
+**Positions**: `forward_posemb(S, cu_seqlens)` builds per-document-reset positions when packed. Because RoPE is relative and the mask is block-diagonal, at `cp_size == 1` this reset is bit-identical to contiguous global positions — it becomes load-bearing only under context parallelism (deferred). **Loss**: boundary/prompt tokens are masked with `-100` (no separate loss-mask tensor) and the loss is token-weighted (the objective returns the loss summed over the micro-batch's tokens; the step divides by the global non-ignored token count).
+
+`cu_seqlens` rides on each `Microbatch`, which every pipeline rank receives, and is threaded through the pipeline as an explicit forward argument (a sibling of `rotary_posemb`, not a module attribute), consumed only by attention and the per-document position reset in `forward_posemb`. The model, engine, and loss support variable-length packing for qwen3, deepseek-v2-lite, and gpt-oss, validated with synthetic `cu_seqlens` via `PACKED_SEQLEN=1 bash tests/test_dualpipev.sh <config>`; qwen3.5 (Gated DeltaNet) is pre-training only and asserts `cu_seqlens is None`. The packed **data pipeline** — turning a tokenized corpus into `cu_seqlens`-bearing samples, and choosing whole-document packing — is a deferred follow-up; no training entrypoint sets `cu_seqlens` yet, so pretraining is the only live data path.
 
 ### Optimized Operators (`pithtrain/operators/`)
 
 - **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
+- **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans`, converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
-- **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2_lite.py`), with MLA-aware ring attention in `ring_attention.py`
+- **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
-- **FP8 Quantization** (`deepgemm_fp8_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization
+- **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization, with `fp8_weight_cache.py` holding the per-step version counter that lets the linear layers reuse a quantized weight across micro-batches
 - **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
 
 Each operator ships a PyTorch reference impl for correctness testing.
 
 ### Training Orchestration (`pithtrain/tasks/pretrain_lm.py`)
 
-`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg`, and `LoggingCfg`. The training loop uses context managers (`distributed_context`, `training_context`, `logging_context`) to set up the full environment.
+`PretrainLMCfg` composes `DistributedCfg`, `TrainingCfg` and `LoggingCfg`, plus a `dataset` path of its own. `launch(cfg)` calls `setup_logging`, `setup_distributed` and `setup_training` in turn, each of which populates its runtime context (see Runtime Contexts below). The corpus and the step counter are neither context nor shared config: only a task that reads a corpus has any use for them, so `setup_dataset` lives in `pretrain_lm.py`, returns the dataset, and `launch` owns it alongside the step counter.
 
 ### Task Module Convention (`pithtrain/tasks/`)
 
-Each task module (`pretrain_lm`, `tokenize_corpus`, `convert_checkpoint`) exposes a `launch(cfg)` entry point plus a task-level `<Task>Cfg`/`<Task>Ctx` (e.g. `PretrainLMCfg`, `TokenizeCorpusCfg`). Two rules keep this consistent:
+Each task module (`pretrain_lm`, `tokenize_corpus`, `convert_checkpoint`) exposes a `launch(cfg)` entry point plus a task-level `<Task>Cfg` (e.g. `PretrainLMCfg`, `TokenizeCorpusCfg`). Runtime state is not carried on a per-task context object; it lives in the process-global context modules (see Runtime Contexts below). Two rules keep this consistent:
 
 - **Configs/contexts keep unique, descriptive names** (`PretrainLMCfg`, not bare `Cfg`) so they stay one-shot greppable — this repo is agent-native and `grep PretrainLMCfg` must locate every use. Import them by symbol: `from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch`.
 - **`launch` is the generic verb** every task shares. In a single-task file import it directly; in a file that drives several tasks, import the *modules* and qualify the call (`tokenize_corpus.launch(...)`, `convert_checkpoint.launch(...)`) to avoid collisions. The composable building blocks (`DistributedCfg`, `TrainingCfg`, `LoggingCfg`) live in `pithtrain/modules/` and are always referenced by their descriptive names.
@@ -136,13 +152,22 @@ Handles checkpoint save/load with resharding between canonical (disk) format and
 
 - `F.grouped_mm` may write NaN to padding rows (beyond `grouped_mm_offs[-1]`). Always truncate to `[:actual_M]` before comparing outputs.
 - FP8 quantization tests use normalized squared-error (`calc_diff`), threshold typically `< 1e-3`.
-- Tests skip gracefully when `deep_gemm` is not installed or CUDA is unavailable.
-- Multi-GPU tests require `torchrun` (see `tests/test_fsdp.sh`).
+- Multi-GPU tests require `torchrun` (see `tests/test_dualpipev.sh`).
 
 ## Config Base Classes
 
 `pithtrain/config.py` defines `SlottedDefault` — all config/context dataclasses inherit from this. Subclasses are declared `@dataclass(init=False, slots=True)`; `SlottedDefault.__init__` auto-applies every field's default (leaving required fields unset), and `to_json_dict()` returns a JSON-serializable representation.
 
+## Runtime Contexts (`pithtrain/contexts/`)
+
+Process-global runtime state, one module per concern (`distributed`, `training`, `logging`). Each holds values that are set once at startup by the matching `setup_*` function and constant thereafter, so code reads them in-line instead of threading them through every constructor and call. Import the module and read fields off it (`distributed.ep_group`), never the bare names — a field does not exist until its `setup_*` runs, so `from ... import ep_group` fails at import and reading it before setup raises `AttributeError`.
+
 ## Agent Skills
 
-This repo ships agent-native workflows under `.agents/skills/` (`add-new-model`, `add-memory-prints`, `capture-nsys-profile`, `analyze-nsys-profile`, `validate-correctness`, `estimate-memory`, `setup-benchmark-inputs`, `launch-with-slurm`). When the user's request matches one of those, invoke the skill rather than re-deriving the workflow from scratch.
+This repository ships agent-native workflows under `.agents/skills/`, loaded automatically. Invoke a skill whenever a request matches one instead of re-deriving the workflow from scratch.
+
+Skills are living documents, and you should keep them sharp as you work. When you notice any of the following, surface it for review rather than editing silently or derailing the task in progress:
+
+- **Fix** a skill you followed that was stale, wrong, or incomplete.
+- **Refine** a skill that worked but whose guidance could be sharper.
+- **Propose** a new skill when you did repeatable, skill-worthy work that none covered.

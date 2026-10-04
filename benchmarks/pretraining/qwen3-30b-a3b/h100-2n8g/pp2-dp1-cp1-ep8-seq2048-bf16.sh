@@ -1,8 +1,10 @@
 #!/bin/bash
 # Launch the training.
 
-TRUN_ARGS=()
-TRUN_ARGS+=(--nnodes=${SLURM_NNODES:-1} --node-rank=${SLURM_NODEID:-0} --nproc-per-node=gpu)
-TRUN_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=${SLURM_LAUNCH_NODE_IPADDR:-localhost}:15213)
+set -euo pipefail
 
-torchrun ${TRUN_ARGS[@]} benchmarks/pretraining/qwen3-30b-a3b/h100-2n8g/pp2-dp1-cp1-ep8-seq2048-bf16.py
+TORCHRUN_ARGS=()
+TORCHRUN_ARGS+=(--nnodes=${SLURM_NNODES:-1} --nproc-per-node=gpu)
+TORCHRUN_ARGS+=(--rdzv-backend=c10d --rdzv-endpoint=$(scontrol show hostnames "${SLURM_STEP_NODELIST:-localhost}" | head -1):15213)
+
+torchrun ${TORCHRUN_ARGS[@]} benchmarks/pretraining/qwen3-30b-a3b/h100-2n8g/pp2-dp1-cp1-ep8-seq2048-bf16.py

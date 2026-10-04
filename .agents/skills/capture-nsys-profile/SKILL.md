@@ -38,7 +38,7 @@ Target DP=1 (smallest world that satisfies the parallelism plan). Assuming 8 GPU
 
 ### If running under SLURM
 
-If `$SLURM_JOB_ID` is set, use the **launch-with-slurm** skill to read the allocation's node count and compare it to the minimum above. If the allocation is short, surface that to the user instead of launching.
+Use the **launch-with-slurm** skill to find the allocation and read its node count; compare it to the minimum above. If the allocation is short, surface that to the user instead of launching.
 
 ## Step 3: Capture the profile
 
@@ -59,9 +59,9 @@ Each node produces one `.nsys-rep` at `workspace/capture-nsys-profile/pithtrain_
 
 ## Common Issues
 
-### `WORLD_SIZE is not divisible by pp*cp*ep`
+### `WORLD_SIZE is not divisible by pp`, or the stage is not divisible by cp or ep
 
-The allocation doesn't have enough GPUs for the requested parallelism. Stop; tell the user their allocation is short (report current `world_size` and required `pp * cp * ep`) and ask whether to reduce PP/EP/CP or request more nodes. Do not silently adjust on their behalf.
+The allocation doesn't have enough GPUs for the requested parallelism. Stop; tell the user their allocation is short (report current `world_size`, and that `pp` must divide it with `cp` and `ep` each dividing `world_size / pp`) and ask whether to reduce PP/EP/CP or request more nodes. Do not silently adjust on their behalf.
 
 ### No `.nsys-rep` produced after the run
 
