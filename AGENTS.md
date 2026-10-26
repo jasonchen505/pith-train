@@ -32,7 +32,7 @@ pytest tests/operators/test_deepgemm_quantize.py -v
 pytest tests/test_deepgemm_fp8_linear_correctness.py -v
 pytest tests/test_grouped_linear_correctness.py -v
 pytest tests/test_ep_dedup_dispatch.py -v
-pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py -v
+pytest tests/test_silu_mul.py tests/test_clamped_swiglu.py tests/test_indexed_bias_add.py tests/test_log_prob.py -v
 pytest tests/operators/test_ring_attention.py -v
 
 # Single test function
@@ -86,7 +86,7 @@ The core pipeline assigns each rank two model chunks in a V-shape (the model is 
 Stages 1, 3, and 5 are the layer's compute entry points — `forward_stage1`, `forward_stage3`, `forward_stage5` on `LayerProtocol` (`pithtrain/models/interface.py`); stages 2 and 4 are all-to-all communication driven by the execution machinery (`pithtrain/pipeline/execution.py`), not layer methods.
 
 Key files:
-- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (supports `forward_only=True` for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
+- `dualpipev.py` — Main scheduler and P2P between pipeline ranks: `DualPipeV.step()` orchestrates overlapped F/B across modules (forward-only when called under `torch.no_grad()`, e.g. for inference), `overlapped_forward_backward()` is the interleaved loop for one pair of micro-batches, plus `layer_partition()`, which distributes decoder layers across pipeline stages — edge stages (which hold `embed_tokens` / `norm`+`lm_head`) get fewer layers to balance memory.
 - `execution.py` — Stage implementations (`stage1_f`, `stage1_b`, etc.), `ExecutionCtx`, the dispatch/combine helpers, and `WeightGradStore` (deferred wgrad for zero-bubble scheduling)
 
 ### FP8 Training
@@ -101,7 +101,7 @@ Properties worth remembering: `cp` and `ep` each need only divide the stage size
 
 `setup_default_process_group` also installs a fail-fast excepthook and passes `DistributedCfg.timeout` (default 15 min) as the collective timeout, so a failed rank does not make peers wait. Both belong to creating the world, so a process that inherits one from its host keeps whatever that host chose.
 
-**Two CP sequence layouts (`pithtrain/operators/cp_sequence.py`).** Softmax attention shards the sequence **zigzag** (rank `r` holds blocks `r` and `2 * cp_size - r - 1` of `2 * cp_size`) to balance causal work; a linear-attention recurrence instead needs **contiguous** (blocks `2r` and `2r + 1`) so that rank order is sequence order. Hybrid models (Qwen3.5) convert with one all-to-all at each boundary between the two kinds of layer, hoisted to the ends of each run of linear-attention layers. The invariant: **hidden states are zigzag at model boundaries and at every attention layer, contiguous within a run of linear-attention layers**; norms, MoE and residuals are per-token and layout-blind. `zigzag_spans(cp_rank, cp_size, seq_len)` is the single definition of the zigzag partition, returning the two global token ranges a rank holds, and both the loader and `forward_posemb` call it. Restating that arithmetic elsewhere mistrains silently rather than raising.
+**Two CP sequence layouts (`pithtrain/operators/cp_sequence.py`).** Softmax attention shards the sequence **zigzag** (rank `r` holds blocks `r` and `2 * cp_size - r - 1` of `2 * cp_size`) to balance causal work; a linear-attention recurrence instead needs **contiguous** (blocks `2r` and `2r + 1`) so that rank order is sequence order. Hybrid models (Qwen3.5) convert with one all-to-all at each boundary between the two kinds of layer, hoisted to the ends of each run of linear-attention layers. The invariant: **hidden states are zigzag at model boundaries and at every attention layer, contiguous within a run of linear-attention layers**; norms, MoE and residuals are per-token and layout-blind. `zigzag_spans(cp_rank, cp_size, seq_len)` is the single definition of the zigzag partition, returning the two global token ranges a rank holds, and both the loader and `forward_posemb` call it. Restating that arithmetic elsewhere mistrains silently rather than raising. A packed sample is sharded the same way one document at a time, the caller padding each document at its end to a multiple of `2 * cp_size` tokens (pad labels `-100`), and `zigzag_varlen_index(cp_rank, cp_size, cu_seqlens, seq_len)` is that partition's single definition, the global index of every token a rank holds: `forward_posemb` calls it, and a packed loader and a routing-replay store must call it too.
 
 ### Model Layer Protocol (`pithtrain/models/interface.py`)
 
@@ -113,23 +113,23 @@ The pipeline is **BSHD** end to end: hidden states are `(B, S, hidden)` through 
 
 **Packed / variable-length (SFT) training** enforces `micro_batch_size == 1`. A micro-batch is `(1, S, hidden)` where `S` is the total token count and several documents are concatenated along the `S` axis; a per-sample `cu_seqlens` (int32 cumulative document offsets `[0, …, S]`) marks the boundaries. So the residual stream is semantically `TD` (`T = S` tokens × `hidden`) wearing a batch-of-one BSHD coat — kept 3-D on purpose so (a) every BSHD-assuming module (norm, MoE, embed, loss, P2P) is untouched and (b) the caller can still split the batch into micro-batches along dim 0 (the `B=1` is that seam).
 
-**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen). `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
+**THD is confined to the attention kernel.** Only attention reshapes `(1, S, H, D) → (S, H, D)` (`squeeze(0)`) to hand FlashAttention-4's varlen entry (`operators/flash_attn_v4.py:flash_attn_varlen_func`) a flat `(total_tokens, H, D)` tensor plus `cu_seqlens`, then `unsqueeze(0)` back. Attention dispatches on `cu_seqlens is None` (dense causal) vs set (block-diagonal varlen), and under context parallelism the same squeeze feeds `ring_attention_varlen_func`, the zigzag ring made block-diagonal by document. `max_seqlen` is passed as `S` — a compile-safe upper bound; FA4 schedules work off `cu_seqlens`, so over-allocating it is free and avoids a per-call device sync.
 
-**Positions**: `forward_posemb(S, cu_seqlens)` builds per-document-reset positions when packed. Because RoPE is relative and the mask is block-diagonal, at `cp_size == 1` this reset is bit-identical to contiguous global positions — it becomes load-bearing only under context parallelism (deferred). **Loss**: boundary/prompt tokens are masked with `-100` (no separate loss-mask tensor) and the loss is token-weighted (the objective returns the loss summed over the micro-batch's tokens; the step divides by the global non-ignored token count).
+**Positions**: `forward_posemb(S, cu_seqlens)` builds per-document-reset positions when packed; under context parallelism it takes each token's global index from `zigzag_varlen_index`, so positions follow the tokens wherever the partition puts them. Because RoPE is relative and the mask is block-diagonal, the reset changes what attention computes only by rounding; it keeps positions within the longest document rather than the packed length, as an inference engine counts them. **Loss**: boundary/prompt tokens are masked with `-100` (no separate loss-mask tensor) and the loss is token-weighted (the objective returns the loss summed over the micro-batch's tokens; the step divides by the global non-ignored token count).
 
-`cu_seqlens` rides on each `Microbatch`, which every pipeline rank receives, and is threaded through the pipeline as an explicit forward argument (a sibling of `rotary_posemb`, not a module attribute), consumed only by attention and the per-document position reset in `forward_posemb`. The packed **data pipeline** — turning a tokenized corpus into `cu_seqlens`-bearing samples, and choosing whole-document packing — is a deferred follow-up; no training entrypoint sets `cu_seqlens` yet, so pretraining is the only live data path.
+`cu_seqlens` rides on each `Microbatch`, which every pipeline rank receives, and is threaded through the pipeline as an explicit forward argument (a sibling of `rotary_posemb`, not a module attribute), consumed only by attention and the per-document position reset in `forward_posemb`. It always holds the boundaries of the whole packed sample, also under context parallelism, where the rest of the micro-batch holds this rank's share of every document. The packed **data pipeline** — turning a tokenized corpus into `cu_seqlens`-bearing samples, and choosing whole-document packing — is a deferred follow-up; no training entrypoint sets `cu_seqlens` yet, so pretraining is the only live data path.
 
 ### Optimized Operators (`pithtrain/operators/`)
 
-- **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard and MLA-aware variants)
-- **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans`, converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
+- **Ring Attention** (`ring_attention.py`) — zigzag ring attention for context parallelism (standard, packed and MLA-aware variants)
+- **CP Sequence** (`cp_sequence.py`) — defines both CP sequence layouts, exposing the zigzag partition as `zigzag_spans` (and, one packed document at a time, as `zigzag_varlen_index`), converts the hidden stream between them, and fetches the conv state a depthwise convolution needs, the tokens before a shard, from the previous rank
 - **FlashAttention v4** (`flash_attn_v4.py`) — Wrapper around the FA4 kernel
 - **MLA** — Multi-head Latent Attention is implemented inside the DeepSeek model (`models/deepseek_v2.py`), with MLA-aware ring attention in `ring_attention.py`
 - **AllToAll** (`all_to_all.py`) — Differentiable collective wrapper
 - **EP Dispatch** (`ep_dispatch.py`) — Fused Triton kernels and orchestration for expert-parallel token dispatch with deduplication
 - **Token Scatter** (`token_scatter.py`) — Triton scatter kernels for grouping tokens by expert ahead of grouped GEMM
 - **FP8 Quantization** (`deepgemm_quantize.py`) — Fused Triton kernels for DeepGEMM-style FP8 quantization, with `fp8_weight_cache.py` holding the per-step version counter that lets the linear layers reuse a quantized weight across micro-batches
-- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`
+- **Fused activations / heads** — `silu_mul.py`, `clamped_swiglu.py`, `indexed_bias_add.py`, `cross_entropy.py`, `log_prob.py`
 
 Each operator ships a PyTorch reference impl for correctness testing.
 

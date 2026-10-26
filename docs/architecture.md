@@ -119,7 +119,7 @@ FP8 matmuls are backed by DeepSeek's [DeepGEMM](https://github.com/deepseek-ai/D
 A whole model flips between FP8 and BF16 through one flag, `TrainingCfg.fp8`. At training setup (`pithtrain/modules/training.py`) it binds the linear classes the models build with, published on the `training` context:
 
 ```python
-training.Linear        = FP8Linear        if cfg.fp8 else nn.Linear
+training.Linear        = FP8Linear        if cfg.fp8 else BF16Linear
 training.GroupedLinear = FP8GroupedLinear if cfg.fp8 else GroupedLinear
 ```
 
@@ -139,7 +139,7 @@ Saving converts localized to canonical, loading converts back. Because the on-di
 A few of the most important, roughly in order:
 
 1. `ep_dispatch.py`: fused Triton kernels for expert-parallel token dispatch with deduplication; central to MoE routing and the all-to-all overlap.
-2. `ring_attention.py`: zigzag, causal-balanced ring attention for context parallelism (standard + MLA-aware variants).
+2. `ring_attention.py`: zigzag, causal-balanced ring attention for context parallelism (standard, packed and MLA-aware variants).
 3. `deepgemm_quantize.py`: fused block-scaled FP8 quantization behind the FP8 training path.
 4. `token_scatter.py`: groups tokens per expert ahead of the grouped GEMM.
 

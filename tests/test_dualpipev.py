@@ -1,10 +1,10 @@
 """
-Test DualPipeV against a single-device reference.
-The loss and gradients are compared with the reference implementation.
+Compare DualPipeV loss, gradients and canonical weight export with a single-device reference.
 """
 
 import argparse
 import os
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Tuple
@@ -22,8 +22,12 @@ from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
+from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.operators.cp_sequence import zigzag_varlen_index
 from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV, Microbatch
 
 
@@ -69,6 +73,14 @@ def objective(
     (target,) = objective_inputs
     loss = criterion(output, target)
     return loss, loss.detach()
+
+
+def records_empty(model: DualPipeV) -> bool:
+    records = []
+    for chunk in model.chunk_records[0] + model.chunk_records[1]:
+        records += [chunk.prolog, chunk.epilog]
+        records += [getattr(layer, f.name) for layer in chunk.layers for f in fields(layer)]
+    return all(getattr(r, f.name) is None for r in records if r is not None for f in fields(r))
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
@@ -144,6 +156,20 @@ def shard_experts(model, ep_rank, ep_size):
             setattr(model, name, new_mod)
         else:
             shard_experts(child, ep_rank, ep_size)
+
+
+def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
+    """
+    Expand this EP rank's expert stacks under global indices, independently of checkpoint.unpack.
+    """
+    result = {}
+    for name, value in model.state_dict().items():
+        if ".experts." not in name:
+            result[name] = value
+            continue
+        for idx, expert in enumerate(value, start=ep_rank * value.shape[0]):
+            result[name.replace(".experts.", ".experts.%d." % idx, 1)] = expert
+    return result
 
 
 def apply_fsdp(model, dtype):
@@ -223,13 +249,14 @@ def main(model_name: str):
     dtype = torch.bfloat16
 
     # This test builds models directly, bypassing setup_model; bind the BF16 linear backend it sets.
+    # The fused classes act as nn.Linear in the single-device reference, and fused accumulation is
+    # installed on the DualPipeV copy only, as setup_model does.
     training.fp8 = False
-    training.Linear = nn.Linear
+    training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
     ragged = os.environ.get("RAGGED_MICROBATCH", "0") == "1"
-    assert not (packed and cp_size > 1), "CP with packed cu_seqlens is not supported yet."
     micro_batch_size = 1 if packed else 3  # packing pins mbs to 1
     num_chunks = 20
     sequence_length = int(os.environ.get("SEQUENCE_LENGTH", "128"))
@@ -296,9 +323,14 @@ def main(model_name: str):
             chunk_l = label_scale * torch.randn(micro_batch_size, seqlen, vocab_size, dtype=dtype)
             chunk_cu = None
             if packed:
-                # Ragged batches vary the document count as well as the token count.
+                # Ragged batches vary the document count as well as the token count. CP documents
+                # are multiples of 2 * cp_size; the first is one token, or one per block under CP.
                 num_docs = 2 + (j % 2) if ragged else 3
-                bounds = [round(seqlen * k / num_docs) for k in range(num_docs + 1)]
+                unit = 2 * cp_size if cp_size > 1 else 1
+                units = seqlen // unit - 1
+                bounds = [0] + [
+                    unit * (1 + round(units * k / (num_docs - 1))) for k in range(num_docs)
+                ]
                 chunk_cu = torch.tensor(bounds, dtype=torch.int32)
             chunks.append((chunk_x, chunk_l, chunk_cu))
         return chunks
@@ -359,9 +391,22 @@ def main(model_name: str):
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
     local_modules.zero_grad()
     apply_fsdp(local_modules, dtype)
+    install_wgrad_accumulation(local_modules)
 
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
+
+    def shard(x: torch.Tensor, cu: torch.Tensor | None) -> torch.Tensor:
+        # A packed sample is sharded one document at a time; cu_seqlens stays the whole sample's.
+        if cu is None:
+            return zigzag_shard(x, cp_rank, cp_size)
+        return x[:, zigzag_varlen_index(cp_rank, cp_size, cu, x.shape[1])]
+
+    def collect(model_outputs, objective_inputs):
+        # Check before step cleanup can hide retained activations.
+        assert records_empty(dualpipev_model), "a forward-only step kept activations mid-step"
+        (output,), (target,) = model_outputs, objective_inputs
+        return None, criterion(output, target)
 
     # Run the DualPipeV step.
     for step_index, chunks in enumerate(chunk_steps):
@@ -371,9 +416,9 @@ def main(model_name: str):
         local_chunks = chunks[dp_rank * num_chunks : (dp_rank + 1) * num_chunks]
         microbatches = [
             Microbatch(
-                model_inputs=(zigzag_shard(x, cp_rank, cp_size),),
+                model_inputs=(shard(x, cu),),
                 cu_seqlens=cu,
-                objective_inputs=(zigzag_shard(lab, cp_rank, cp_size),),
+                objective_inputs=(shard(lab, cu),),
             )
             for x, lab, cu in local_chunks
         ]
@@ -382,7 +427,12 @@ def main(model_name: str):
             print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
+        # Training must safely reuse the forward-only step's records.
+        with torch.no_grad():
+            collected_outputs = dualpipev_model.step(microbatches, collect)
+        assert records_empty(dualpipev_model), "a forward-only step kept activations"
         objective_outputs = dualpipev_model.step(microbatches, objective)
+        assert records_empty(dualpipev_model), "a training step kept activations"
 
         if distributed.rank == 0:
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
@@ -391,6 +441,7 @@ def main(model_name: str):
         # Validate the loss.
         if pp_rank == 0:
             loss = torch.stack(objective_outputs)
+            torch.testing.assert_close(torch.stack(collected_outputs), loss, rtol=0, atol=5e-3)
             if cp_size > 1:
                 # Every rank takes the mean over its own S/cp tokens, so the mean over the
                 # whole sequence is the average of those.
@@ -404,7 +455,7 @@ def main(model_name: str):
             )
             assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
         else:
-            assert objective_outputs == []
+            assert collected_outputs == objective_outputs == []
 
         if distributed.rank == 0:
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
@@ -418,10 +469,8 @@ def main(model_name: str):
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
         if p.grad is None:
-            print(
-                "[warn] rank-%d, Parameter %s doesn't have a gradient, skipping."
-                % (distributed.rank, n)
-            )
+            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, n))
+            failed = True
             continue
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
@@ -487,6 +536,26 @@ def main(model_name: str):
     if distributed.rank == 0:
         print("[INFO] All gradients match the reference.", flush=True)
     torch.distributed.barrier()
+
+    # Export before and after changing the weights to reject caches retained across syncs.
+    training.model = dualpipev_model
+    for updated in (False, True):
+        if updated:
+            with torch.no_grad():
+                for p in dualpipev_model.parameters():
+                    w = p.to_local()
+                    w.neg_().masked_fill_(w == 0, 1)
+        reference = canonical_state_dict(local_full_modules[0], ep_rank)
+        reference.update(canonical_state_dict(local_full_modules[1], ep_rank))
+        for name, tensor in iter_canonical_parameters():
+            w = reference.pop(name)
+            if updated:
+                w = w.neg().masked_fill_(w == 0, 1)
+            assert torch.equal(tensor, w), (distributed.rank, name, updated)
+        assert not reference, (distributed.rank, sorted(reference)[:5])
+    torch.distributed.barrier()
+    if distributed.rank == 0:
+        print("[INFO] All canonical parameters match the reference.", flush=True)
 
 
 @record
